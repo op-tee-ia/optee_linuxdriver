@@ -26,6 +26,9 @@
 #include <linux/tee_drv.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
+#if defined(CONFIG_X86_64)
+#include <linux/smp.h>
+#endif
 #include "optee_private.h"
 #include "optee_smc.h"
 #include "shm_pool.h"
@@ -33,6 +36,10 @@
 #define DRIVER_NAME "optee"
 
 #define OPTEE_SHM_NUM_PRIV_PAGES	CONFIG_OPTEE_SHM_NUM_PRIV_PAGES
+
+#if defined(CONFIG_X86_64)
+#define OPTEE_VMCALL_SMC       0x6F707400
+#endif
 
 /**
  * optee_from_msg_param() - convert from OPTEE_MSG parameters to
@@ -510,6 +517,50 @@ err_memunmap:
 	return rc;
 }
 
+#if defined(CONFIG_X86_64)
+struct optee_smc_interface {
+    unsigned long args[5];
+};
+
+static void optee_smc(void *args)
+{
+    struct optee_smc_interface *p_args = args;
+    __asm__ __volatile__(
+ 	"vmcall;"
+ 	: "=D"(p_args->args[0]), "=S"(p_args->args[1]),
+	"=d"(p_args->args[2]), "=b"(p_args->args[3])
+ 	: "a"(OPTEE_VMCALL_SMC), "D"(p_args->args[0]), "S"(p_args->args[1]),
+	"d"(p_args->args[2]), "b"(p_args->args[3]), "c"(p_args->args[4])
+    );
+}
+
+/* Simple wrapper functions to be able to use a function pointer */
+static void optee_smccc_smc(unsigned long a0, unsigned long a1,
+			    unsigned long a2, unsigned long a3,
+			    unsigned long a4, unsigned long a5,
+			    unsigned long a6, unsigned long a7,
+			    struct arm_smccc_res *res)
+{
+	int ret = 0;
+	struct optee_smc_interface s;
+
+	s.args[0] = a0;
+	s.args[1] = a1;
+	s.args[2] = a2;
+	s.args[3] = a3;
+	s.args[4] = a5 << 32 | a4;
+
+	ret = smp_call_function_single(0, optee_smc, (void *)&s, 1);
+	if (ret) {
+		pr_err("%s: smp_call_function_single failed: %d\n", __func__, ret);
+	}
+
+	res->a0 = s.args[0];
+	res->a1 = s.args[1];
+	res->a2 = s.args[2];
+	res->a3 = s.args[3];
+}
+#else
 /* Simple wrapper functions to be able to use a function pointer */
 static void optee_smccc_smc(unsigned long a0, unsigned long a1,
 			    unsigned long a2, unsigned long a3,
@@ -548,8 +599,13 @@ static optee_invoke_fn *get_invoke_func(struct device_node *np)
 	pr_warn("invalid \"method\" property: %s\n", method);
 	return ERR_PTR(-EINVAL);
 }
+#endif
 
+#if defined(CONFIG_X86_64)
+static struct optee *optee_probe(void)
+#else
 static struct optee *optee_probe(struct device_node *np)
+#endif
 {
 	optee_invoke_fn *invoke_fn;
 	struct tee_shm_pool *pool;
@@ -559,7 +615,11 @@ static struct optee *optee_probe(struct device_node *np)
 	u32 sec_caps;
 	int rc;
 
+#if defined(CONFIG_X86_64)
+	invoke_fn = optee_smccc_smc;
+#else
 	invoke_fn = get_invoke_func(np);
+#endif
 	if (IS_ERR(invoke_fn))
 		return (void *)invoke_fn;
 
@@ -684,6 +744,21 @@ static const struct of_device_id optee_match[] = {
 
 static struct optee *optee_svc;
 
+#if defined(CONFIG_X86_64)
+static int __init optee_driver_init(void)
+{
+	struct optee *optee;
+
+	optee = optee_probe();
+
+	if (IS_ERR(optee))
+		return PTR_ERR(optee);
+
+	optee_svc = optee;
+
+	return 0;
+}
+#else
 static int __init optee_driver_init(void)
 {
 	struct device_node *fw_np;
@@ -709,6 +784,7 @@ static int __init optee_driver_init(void)
 
 	return 0;
 }
+#endif
 module_init(optee_driver_init);
 
 static void __exit optee_driver_exit(void)
