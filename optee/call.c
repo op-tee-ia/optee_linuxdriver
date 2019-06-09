@@ -267,6 +267,7 @@ int optee_open_session(struct tee_context *ctx,
 		mutex_unlock(&ctxdata->mutex);
 	} else {
 		kfree(sess);
+		rc = -1;
 	}
 
 	if (optee_from_msg_param(param, arg->num_params, msg_arg->params + 2)) {
