@@ -18,6 +18,10 @@
 #include "optee_trace.h"
 #include "optee_bench.h"
 
+#if defined(CONFIG_X86_64)
+#include <asm/io.h>
+#endif
+
 struct optee_call_waiter {
 	struct list_head list_node;
 	struct completion c;
@@ -550,6 +554,9 @@ static bool is_normal_memory(pgprot_t p)
 		((pgprot_val(p) & L_PTE_MT_MASK) == L_PTE_MT_WRITEBACK));
 #elif defined(CONFIG_ARM64)
 	return (pgprot_val(p) & PTE_ATTRINDX_MASK) == PTE_ATTRINDX(MT_NORMAL);
+#elif defined(CONFIG_X86_64)
+	//TODO: will figure out how to implement it on x86 platform, return true for now.
+	return true;
 #else
 #error "Unuspported architecture"
 #endif

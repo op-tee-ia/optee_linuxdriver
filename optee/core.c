@@ -27,6 +27,10 @@
 
 #define OPTEE_SHM_NUM_PRIV_PAGES	CONFIG_OPTEE_SHM_NUM_PRIV_PAGES
 
+#if defined(CONFIG_X86_64)
+#define OPTEE_VMCALL_SMC       0x6F707400
+#endif
+
 /**
  * optee_from_msg_param() - convert from OPTEE_MSG parameters to
  *			    struct tee_param
@@ -535,6 +539,54 @@ err_memunmap:
 }
 
 /* Simple wrapper functions to be able to use a function pointer */
+
+#if defined(CONFIG_X86_64)
+struct optee_smc_interface {
+    unsigned long args[5];
+};
+
+static long optee_smc(void *args)
+{
+    struct optee_smc_interface *p_args = args;
+    __asm__ __volatile__(
+	"vmcall;"
+	: "=D"(p_args->args[0]), "=S"(p_args->args[1]),
+	"=d"(p_args->args[2]), "=b"(p_args->args[3])
+	: "a"(OPTEE_VMCALL_SMC), "D"(p_args->args[0]), "S"(p_args->args[1]),
+	"d"(p_args->args[2]), "b"(p_args->args[3]), "c"(p_args->args[4])
+	);
+
+	return 0;
+}
+
+/* Simple wrapper functions to be able to use a function pointer */
+static void optee_smccc_smc(unsigned long a0, unsigned long a1,
+			    unsigned long a2, unsigned long a3,
+			    unsigned long a4, unsigned long a5,
+			    unsigned long a6, unsigned long a7,
+			    struct arm_smccc_res *res)
+{
+	int ret = 0;
+	struct optee_smc_interface s;
+
+	s.args[0] = a0;
+	s.args[1] = a1;
+	s.args[2] = a2;
+	s.args[3] = a3;
+	//TODO: use two registers to save a4 and a5 seperately later.
+	s.args[4] = a5 << 32 | a4;
+
+	ret = work_on_cpu(0, optee_smc, (void *)&s);
+	if (ret) {
+		pr_err("%s: work_on_cpu failed: %d\n", __func__, ret);
+	}
+
+	res->a0 = s.args[0];
+	res->a1 = s.args[1];
+	res->a2 = s.args[2];
+	res->a3 = s.args[3];
+}
+#else
 static void optee_smccc_smc(unsigned long a0, unsigned long a1,
 			    unsigned long a2, unsigned long a3,
 			    unsigned long a4, unsigned long a5,
@@ -572,6 +624,7 @@ static optee_invoke_fn *get_invoke_func(struct device *dev)
 	pr_warn("invalid \"method\" property: %s\n", method);
 	return ERR_PTR(-EINVAL);
 }
+#endif
 
 static int optee_remove(struct platform_device *pdev)
 {
@@ -614,7 +667,12 @@ static int optee_probe(struct platform_device *pdev)
 	u32 sec_caps;
 	int rc;
 
+#if defined(CONFIG_X86_64)
+	invoke_fn = optee_smccc_smc;
+#else
 	invoke_fn = get_invoke_func(&pdev->dev);
+#endif
+
 	if (IS_ERR(invoke_fn))
 		return PTR_ERR(invoke_fn);
 
@@ -722,6 +780,74 @@ err:
 	return rc;
 }
 
+#if defined(CONFIG_X86_64)
+static const struct of_device_id optee_dt_match[] = {
+	{ .compatible = "optee-tz" },
+	{},
+};
+MODULE_DEVICE_TABLE(of, optee_dt_match);
+
+static struct device_node optee_dev_node = {
+	.name = "optee-tz",
+};
+
+void optee_dev_release(struct device *dev)
+{
+	return;
+}
+
+static struct platform_device optee_platform_dev = {
+		.name = "optee-tz",
+		.id = -1,
+		.num_resources = 0,
+		.dev = {
+			.release = optee_dev_release,
+			.of_node = &optee_dev_node,
+	},
+};
+
+static struct platform_device *optee_devices[] __initdata = {
+	&optee_platform_dev
+};
+
+static struct platform_driver optee_driver = {
+	.probe  = optee_probe,
+	.remove = optee_remove,
+	.driver = {
+		.name = "optee-tz",
+		.of_match_table = optee_dt_match,
+	},
+};
+
+static int __init optee_drv_init(void)
+{
+	int ret;
+
+#ifndef CONFIG_OF_EARLY_FLATTREE
+	ret = platform_add_devices(optee_devices, ARRAY_SIZE(optee_devices));
+	if (ret) {
+		pr_err("platform_add_devices() failed, ret %d\n", ret);
+		return ret;
+	}
+#endif
+
+	ret = platform_driver_register(&optee_driver);
+
+	return ret;
+}
+
+static void __exit optee_drv_exit(void)
+{
+	platform_driver_unregister(&optee_driver);
+
+#ifndef CONFIG_OF_EARLY_FLATTREE
+		platform_device_unregister(&optee_platform_dev);
+#endif
+}
+
+module_init(optee_drv_init);
+module_exit(optee_drv_exit);
+#else
 static const struct of_device_id optee_dt_match[] = {
 	{ .compatible = "linaro,optee-tz" },
 	{},
@@ -737,6 +863,7 @@ static struct platform_driver optee_driver = {
 	},
 };
 module_platform_driver(optee_driver);
+#endif
 
 MODULE_AUTHOR("Linaro");
 MODULE_DESCRIPTION("OP-TEE driver");
