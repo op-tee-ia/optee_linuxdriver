@@ -18,6 +18,11 @@
 #include <linux/types.h>
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
+#if defined(CONFIG_OPTEE_HV_QEMU)
+#include <linux/semaphore.h>
+#include <net/sock.h>
+#include <uapi/linux/vm_sockets.h>
+#endif
 #include "optee_bench.h"
 #include "optee_private.h"
 #include "optee_smc.h"
@@ -27,8 +32,21 @@
 
 #define OPTEE_SHM_NUM_PRIV_PAGES	CONFIG_OPTEE_SHM_NUM_PRIV_PAGES
 
-#if defined(CONFIG_X86_64)
+#if defined(CONFIG_OPTEE_HV_IKGT)
 #define OPTEE_VMCALL_SMC       0x6F707400
+#endif
+
+#if defined(CONFIG_OPTEE_HV_QEMU)
+#define VIRTIO_SHM_COPY_REQ 	0x5a5a5a5a
+#define VIRTIO_SMC_BUFFER_LEN	0x40
+#define VIRTIO_VSOCK_BUFF_LEN	0x10000
+#define VIRTIO_VSOCK_TEE_PORT	1234
+
+static struct socket *host_smc_sock = NULL;
+static struct socket *tee_sock = NULL;
+phys_addr_t optee_shm_offset;
+
+static DEFINE_SEMAPHORE(optee_smc_lock);
 #endif
 
 /**
@@ -46,6 +64,9 @@ int optee_from_msg_param(struct tee_param *params, size_t num_params,
 	size_t n;
 	struct tee_shm *shm;
 	phys_addr_t pa;
+#if defined(CONFIG_OPTEE_HV_QEMU)
+	void *va = NULL;
+#endif
 
 	for (n = 0; n < num_params; n++) {
 		struct tee_param *p = params + n;
@@ -82,6 +103,21 @@ int optee_from_msg_param(struct tee_param *params, size_t num_params,
 			rc = tee_shm_get_pa(shm, 0, &pa);
 			if (rc)
 				return rc;
+#if defined(CONFIG_OPTEE_HV_QEMU)
+			pa = pa - optee_shm_offset;
+			//Here we don't distinguish output or input attribute, just copy
+			if (mp->u.tmem.size < VIRTIO_VSOCK_BUFF_LEN) {
+				va = tee_shm_get_va(shm, mp->u.tmem.buf_ptr - pa);
+				if (!va)
+					return -EINVAL;
+				rc = copy_shm(va, mp->u.tmem.buf_ptr, mp->u.tmem.size);
+				if (rc < 0) {
+					pr_err("%s: copy_shm 0x%llx/0x%llx failed\n", __func__,
+						mp->u.tmem.buf_ptr, mp->u.tmem.size);
+					return -EINVAL;
+				}
+			}
+#endif
 			p->u.memref.shm_offs = mp->u.tmem.buf_ptr - pa;
 			p->u.memref.shm = shm;
 			break;
@@ -131,6 +167,9 @@ static int to_msg_param_tmp_mem(struct optee_msg_param *mp,
 	rc = tee_shm_get_pa(p->u.memref.shm, p->u.memref.shm_offs, &pa);
 	if (rc)
 		return rc;
+#if defined(CONFIG_OPTEE_HV_QEMU)
+	pa = pa - optee_shm_offset;
+#endif
 
 	mp->u.tmem.buf_ptr = pa;
 	mp->attr |= OPTEE_MSG_ATTR_CACHE_PREDEFINED <<
@@ -303,6 +342,9 @@ static void optee_release(struct tee_context *ctx)
 			memset(arg, 0, sizeof(*arg));
 			arg->cmd = OPTEE_MSG_CMD_CLOSE_SESSION;
 			arg->session = sess->session_id;
+#if defined(CONFIG_OPTEE_HV_QEMU)
+			arg->num_params = 0;
+#endif
 			optee_do_call_with_arg(ctx, parg);
 		}
 		kfree(sess);
@@ -491,19 +533,34 @@ optee_config_shm_memremap(optee_invoke_fn *invoke_fn, void **memremaped_shm)
 
 	begin = roundup(res.result.start, PAGE_SIZE);
 	end = rounddown(res.result.start + res.result.size, PAGE_SIZE);
-	paddr = begin;
 	size = end - begin;
+
+#if defined(CONFIG_OPTEE_HV_QEMU)
+	va = kmalloc(size, GFP_KERNEL);
+	if (!va) {
+		pr_err("shared memory 0x%lx kmalloc failed\n", size);
+		return ERR_PTR(-EINVAL);
+	}
+	paddr = virt_to_phys(va);
+	optee_shm_offset = paddr - begin;
+	pr_info("va=0x%p/paddr=0x%llx/size=0x%lx/tee=0x%llx/offset=0x%llx\n",
+			va, paddr, size, begin, optee_shm_offset);
+#else
+	paddr = begin;
+#endif
 
 	if (size < 2 * OPTEE_SHM_NUM_PRIV_PAGES * PAGE_SIZE) {
 		pr_err("too small shared memory area\n");
 		return ERR_PTR(-EINVAL);
 	}
 
+#if !defined(CONFIG_OPTEE_HV_QEMU)
 	va = memremap(paddr, size, MEMREMAP_WB);
 	if (!va) {
 		pr_err("shared memory ioremap failed\n");
 		return ERR_PTR(-EINVAL);
 	}
+#endif
 	vaddr = (unsigned long)va;
 
 	rc = tee_shm_pool_mgr_alloc_res_mem(vaddr, paddr, sz,
@@ -540,7 +597,7 @@ err_memunmap:
 
 /* Simple wrapper functions to be able to use a function pointer */
 
-#if defined(CONFIG_X86_64)
+#if defined(CONFIG_OPTEE_HV_IKGT)
 struct optee_smc_interface {
     unsigned long args[5];
 };
@@ -585,6 +642,100 @@ static void optee_smccc_smc(unsigned long a0, unsigned long a1,
 	res->a1 = s.args[1];
 	res->a2 = s.args[2];
 	res->a3 = s.args[3];
+}
+#elif defined(CONFIG_OPTEE_HV_QEMU)
+static void optee_smccc_smc(unsigned long a0, unsigned long a1,
+			    unsigned long a2, unsigned long a3,
+			    unsigned long a4, unsigned long a5,
+			    unsigned long a6, unsigned long a7,
+			    struct arm_smccc_res *res)
+{
+	struct msghdr msg;
+	unsigned long buffer[8];
+	struct kvec iov[2];
+	int rc;
+
+	if (down_interruptible(&optee_smc_lock)) {
+		pr_warn("optee_smccc_smc not get lock\n");
+		return;
+	}
+
+	buffer[0] = a0;
+	buffer[1] = a1;
+	buffer[2] = a2;
+	buffer[3] = a3;
+	buffer[4] = a4;
+	buffer[5] = a5;
+	buffer[6] = a6;
+	buffer[7] = a7;
+
+	pr_info("send smc message 0x%lx/0x%lx/0x%lx/0x%lx/0x%lx\n",
+		buffer[0], buffer[1], buffer[2], buffer[3], buffer[4]);
+	memset(&msg, 0, sizeof(msg));
+	iov[0].iov_base = buffer;
+	iov[0].iov_len = VIRTIO_SMC_BUFFER_LEN;
+	if (a0 == OPTEE_SMC_RETURN_RPC_COPY_SHM) {
+		iov[1].iov_base = phys_to_virt(a1 + optee_shm_offset);
+		iov[1].iov_len = a2;
+		buffer[0] = OPTEE_SMC_CALL_RETURN_FROM_RPC;
+		rc = kernel_sendmsg(tee_sock, &msg, iov, 2, (a2 + VIRTIO_SMC_BUFFER_LEN));
+	} else {
+		rc = kernel_sendmsg(tee_sock, &msg, iov, 1, VIRTIO_SMC_BUFFER_LEN);
+	}
+	pr_info("sent %d smc message\n", rc);
+
+	memset(&msg, 0, sizeof(msg));
+	iov[0].iov_base = buffer;
+	iov[0].iov_len = VIRTIO_SMC_BUFFER_LEN;
+	rc = kernel_recvmsg(tee_sock, &msg, iov, 1, VIRTIO_SMC_BUFFER_LEN, MSG_WAITFORONE);
+
+	pr_info("recv %d smc message 0x%lx/0x%lx/0x%lx/0x%lx/0x%lx/0x%lx/0x%lx/0x%lx\n",
+		rc, buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6],
+		buffer[7]);
+	memcpy(res, buffer, sizeof(struct arm_smccc_res));
+
+	up(&optee_smc_lock);
+}
+
+int copy_shm(void* data, phys_addr_t paddr, size_t size)
+{
+	struct msghdr msg;
+	unsigned long buffer[8];
+	struct kvec iov[2];
+	int rc;
+
+	if (down_interruptible(&optee_smc_lock)) {
+		pr_warn("copy_shm not get lock\n");
+		return -EINVAL;
+	}
+
+	buffer[0] = VIRTIO_SHM_COPY_REQ;
+	buffer[1] = paddr;
+	buffer[2] = size;
+	buffer[3] = 0;
+	buffer[4] = 0;
+	buffer[5] = 0;
+	buffer[6] = 0;
+	buffer[7] = 0;
+
+	pr_info("send copy shm message: 0x%lx/0x%lx\n", buffer[1], buffer[2]);
+	memset(&msg, 0, sizeof(msg));
+	iov[0].iov_base = buffer;
+	iov[0].iov_len = VIRTIO_SMC_BUFFER_LEN;
+	rc = kernel_sendmsg(tee_sock, &msg, iov, 1, VIRTIO_SMC_BUFFER_LEN);
+	pr_info("sent %d copy shm message\n", rc);
+	if (rc < 0)
+		goto err;
+
+	memset(&msg, 0, sizeof(msg));
+	iov[1].iov_base = data;
+	iov[1].iov_len = size;
+	rc = kernel_recvmsg(tee_sock, &msg, iov, 2, (size + VIRTIO_SMC_BUFFER_LEN), MSG_WAITFORONE);
+	pr_info("recv %d copy shm message\n", rc);
+
+err:
+	up(&optee_smc_lock);
+	return rc;
 }
 #else
 static void optee_smccc_smc(unsigned long a0, unsigned long a1,
@@ -646,7 +797,11 @@ static int optee_remove(struct platform_device *pdev)
 
 	tee_shm_pool_free(optee->pool);
 	if (optee->memremaped_shm)
+#if defined(CONFIG_OPTEE_HV_QEMU)
+		kfree(optee->memremaped_shm);
+#else
 		memunmap(optee->memremaped_shm);
+#endif
 	optee_wait_queue_exit(&optee->wait_queue);
 	optee_supp_uninit(&optee->supp);
 	mutex_destroy(&optee->call_queue.mutex);
@@ -654,6 +809,12 @@ static int optee_remove(struct platform_device *pdev)
 	kfree(optee);
 
 	optee_bm_disable();
+
+#if defined(CONFIG_OPTEE_HV_QEMU)
+	sock_release(tee_sock);
+	sock_release(host_smc_sock);
+#endif
+
 	return 0;
 }
 
@@ -668,6 +829,42 @@ static int optee_probe(struct platform_device *pdev)
 	int rc;
 
 #if defined(CONFIG_X86_64)
+#if defined(CONFIG_OPTEE_HV_QEMU)
+	union {
+		struct sockaddr sa;
+		struct sockaddr_vm svm;
+	} smc_addr = {
+		.svm = {
+			.svm_family = AF_VSOCK,
+			.svm_port = VIRTIO_VSOCK_TEE_PORT,
+			.svm_cid = VMADDR_CID_ANY,
+		},
+	};
+
+	rc = sock_create_kern(&init_net, AF_VSOCK, SOCK_STREAM, 0, &host_smc_sock);
+	if (rc) {
+		pr_warn("host_smc_sock create failed\n");
+		goto err;
+	}
+
+	rc = kernel_bind(host_smc_sock, &smc_addr.sa, sizeof(smc_addr));
+	if (rc) {
+		pr_warn("host_smc_sock bind failed 0x%x\n", rc);
+		goto err;
+	}
+
+	rc = kernel_listen(host_smc_sock, 32); 
+	if (rc) {
+		pr_warn("host_smc_sock listen failed 0x%x\n", rc);
+		goto err;
+	}
+
+	rc = kernel_accept(host_smc_sock, &tee_sock, 0); 
+	if (rc) {
+		pr_warn("host_smc_sock accept failed 0x%x\n", rc);
+		goto err;
+	}
+#endif
 	invoke_fn = optee_smccc_smc;
 #else
 	invoke_fn = get_invoke_func(&pdev->dev);
@@ -776,21 +973,21 @@ err:
 	if (pool)
 		tee_shm_pool_free(pool);
 	if (memremaped_shm)
+#if defined(CONFIG_OPTEE_HV_QEMU)
+		kfree(memremaped_shm);
+#else
 		memunmap(memremaped_shm);
+#endif
+#if defined(CONFIG_OPTEE_HV_QEMU)
+	if (tee_sock)
+		sock_release(tee_sock);
+	if (host_smc_sock)
+		sock_release(host_smc_sock);
+#endif
 	return rc;
 }
 
 #if defined(CONFIG_X86_64)
-static const struct of_device_id optee_dt_match[] = {
-	{ .compatible = "optee-tz" },
-	{},
-};
-MODULE_DEVICE_TABLE(of, optee_dt_match);
-
-static struct device_node optee_dev_node = {
-	.name = "optee-tz",
-};
-
 void optee_dev_release(struct device *dev)
 {
 	return;
@@ -799,15 +996,9 @@ void optee_dev_release(struct device *dev)
 static struct platform_device optee_platform_dev = {
 		.name = "optee-tz",
 		.id = -1,
-		.num_resources = 0,
 		.dev = {
 			.release = optee_dev_release,
-			.of_node = &optee_dev_node,
 	},
-};
-
-static struct platform_device *optee_devices[] __initdata = {
-	&optee_platform_dev
 };
 
 static struct platform_driver optee_driver = {
@@ -815,23 +1006,23 @@ static struct platform_driver optee_driver = {
 	.remove = optee_remove,
 	.driver = {
 		.name = "optee-tz",
-		.of_match_table = optee_dt_match,
+		.owner = THIS_MODULE,
 	},
 };
 
 static int __init optee_drv_init(void)
 {
-	int ret;
+	int ret = 0;
 
-#ifndef CONFIG_OF_EARLY_FLATTREE
-	ret = platform_add_devices(optee_devices, ARRAY_SIZE(optee_devices));
+	ret = platform_device_register(&optee_platform_dev);
 	if (ret) {
-		pr_err("platform_add_devices() failed, ret %d\n", ret);
+		pr_err("platform_device_register() failed, ret %d\n", ret);
 		return ret;
 	}
-#endif
 
-	ret = platform_driver_register(&optee_driver);
+	ret = platform_driver_probe(&optee_driver, optee_probe);
+	if (ret)
+		pr_err("platform_driver_probe() failed, ret %d\n", ret);
 
 	return ret;
 }
@@ -840,9 +1031,7 @@ static void __exit optee_drv_exit(void)
 {
 	platform_driver_unregister(&optee_driver);
 
-#ifndef CONFIG_OF_EARLY_FLATTREE
-		platform_device_unregister(&optee_platform_dev);
-#endif
+	platform_device_unregister(&optee_platform_dev);
 }
 
 module_init(optee_drv_init);
