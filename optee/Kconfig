@@ -22,3 +22,19 @@ config OPTEE_BENCHMARK
 	help
 	  This enables benchmarking feature in the OP-TEE Trusted
 	  Execution Environment (TEE) driver.
+
+config OPTEE_HV_IKGT
+	bool "OP-TEE on top of IKGT hypervisor"
+	depends on OPTEE
+	depends on X86_64
+	help
+	  This enables IKGT based SMC in the OP-TEE Trusted
+	  Execution Environment (TEE) driver.
+
+config OPTEE_HV_QEMU
+	bool "OP-TEE on top of QEMU hypervisor"
+	depends on OPTEE
+	depends on X86_64
+	help
+	  This enables QEMU based SMC in the OP-TEE Trusted
+	  Execution Environment (TEE) driver.
