@@ -543,8 +543,6 @@ optee_config_shm_memremap(optee_invoke_fn *invoke_fn, void **memremaped_shm)
 	}
 	paddr = virt_to_phys(va);
 	optee_shm_offset = paddr - begin;
-	pr_info("va=0x%p/paddr=0x%llx/size=0x%lx/tee=0x%llx/offset=0x%llx\n",
-			va, paddr, size, begin, optee_shm_offset);
 #else
 	paddr = begin;
 #endif
@@ -669,8 +667,6 @@ static void optee_smccc_smc(unsigned long a0, unsigned long a1,
 	buffer[6] = a6;
 	buffer[7] = a7;
 
-	pr_info("send smc message 0x%lx/0x%lx/0x%lx/0x%lx/0x%lx\n",
-		buffer[0], buffer[1], buffer[2], buffer[3], buffer[4]);
 	memset(&msg, 0, sizeof(msg));
 	iov[0].iov_base = buffer;
 	iov[0].iov_len = VIRTIO_SMC_BUFFER_LEN;
@@ -682,16 +678,12 @@ static void optee_smccc_smc(unsigned long a0, unsigned long a1,
 	} else {
 		rc = kernel_sendmsg(tee_sock, &msg, iov, 1, VIRTIO_SMC_BUFFER_LEN);
 	}
-	pr_info("sent %d smc message\n", rc);
 
 	memset(&msg, 0, sizeof(msg));
 	iov[0].iov_base = buffer;
 	iov[0].iov_len = VIRTIO_SMC_BUFFER_LEN;
 	rc = kernel_recvmsg(tee_sock, &msg, iov, 1, VIRTIO_SMC_BUFFER_LEN, MSG_WAITFORONE);
 
-	pr_info("recv %d smc message 0x%lx/0x%lx/0x%lx/0x%lx/0x%lx/0x%lx/0x%lx/0x%lx\n",
-		rc, buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6],
-		buffer[7]);
 	memcpy(res, buffer, sizeof(struct arm_smccc_res));
 
 	up(&optee_smc_lock);
@@ -718,12 +710,10 @@ int copy_shm(void* data, phys_addr_t paddr, size_t size)
 	buffer[6] = 0;
 	buffer[7] = 0;
 
-	pr_info("send copy shm message: 0x%lx/0x%lx\n", buffer[1], buffer[2]);
 	memset(&msg, 0, sizeof(msg));
 	iov[0].iov_base = buffer;
 	iov[0].iov_len = VIRTIO_SMC_BUFFER_LEN;
 	rc = kernel_sendmsg(tee_sock, &msg, iov, 1, VIRTIO_SMC_BUFFER_LEN);
-	pr_info("sent %d copy shm message\n", rc);
 	if (rc < 0)
 		goto err;
 
@@ -731,7 +721,6 @@ int copy_shm(void* data, phys_addr_t paddr, size_t size)
 	iov[1].iov_base = data;
 	iov[1].iov_len = size;
 	rc = kernel_recvmsg(tee_sock, &msg, iov, 2, (size + VIRTIO_SMC_BUFFER_LEN), MSG_WAITFORONE);
-	pr_info("recv %d copy shm message\n", rc);
 
 err:
 	up(&optee_smc_lock);
