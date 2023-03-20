@@ -30,15 +30,15 @@ The driver software has been tested based on:
 	$ mkdir linux
 	$ cd linux: Put Linux kernel or header files here
 
-### Download the source code
-	$ cd $HOME
-	$ cd devel
+### Download the driver source code and replace original tee driver
+	$ cd $HOME/devel/linux/drivers
+	$ rm -fr tee
 	$ git clone https://github.com/op-tee-ia/optee_linuxdriver.git
+	$ mv optee_linuxdriver tee
 
 ### Config and Build
 	$ cd $HOME/devel/linux
-	$ make mrproper
 	$ make menuconfig
     "Device Drivers" --> "TEE Drivers" --> Select either "OP-TEE on top of IKGT hypervisor"
-    or "OP-TEE on top of QEMU hypervisor"
-	$ make M=$HOME/devel/optee_linuxdriver modules
+    or "OP-TEE on top of QEMU hypervisor" based on the hypervisor you are using
+	$ make M=drivers/tee
